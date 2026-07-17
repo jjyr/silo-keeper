@@ -1,0 +1,6 @@
+/target/
+/.mise.local.toml
+/config.toml
+*.dump
+*.zst
+*.age

@@ -1,0 +1,29 @@
+version = 1
+
+[storage]
+type = "s3"
+bucket = "company-production-backups"
+region = "eu-central-1"
+endpoint = "https://s3.eu-central-1.amazonaws.com"
+prefix = "moat-silo"
+access_key_id = "<s3-access-key>"
+secret_access_key = "<s3-secret-key>"
+# Set to 0 when Object Lock is not used. S3 Versioning is always required.
+object_lock_days = 14
+
+[defaults]
+state_dir = "/var/lib/moat-silo"
+scratch_dir = "/var/lib/moat-silo/tmp"
+randomized_delay_seconds = 900
+max_backup_age_hours = 36
+
+[[targets]]
+name = "production-db"
+type = "postgres"
+database_url = "postgres://backup-user:<password>@127.0.0.1:5432/production"
+on_calendar = "*-*-* 02:15:00 UTC"
+age_recipient = "age1..."
+healthcheck_url = "https://hc-ping.com/<check-id>"
+enabled = true
+# Optional per-target override; otherwise defaults.max_backup_age_hours is used.
+max_backup_age_hours = 36

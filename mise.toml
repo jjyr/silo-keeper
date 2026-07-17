@@ -1,0 +1,22 @@
+[tools]
+rust = "1.94.0"
+
+[env]
+RUSTC_WRAPPER = ""
+
+[tasks.build]
+description = "Build the release binary"
+run = "cargo build --release"
+
+[tasks.test]
+description = "Run all tests"
+run = "cargo test"
+
+[tasks.check]
+description = "Run formatting, lint, and tests"
+run = '''
+set -e
+cargo fmt --all --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+'''
