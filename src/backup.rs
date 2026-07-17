@@ -145,11 +145,7 @@ fn perform_backup(config: &Config, target: &TargetConfig) -> Result<BackupOutcom
         .arg(&dump_path);
     run_checked(&mut pg_dump, "pg_dump")?;
 
-    let mut zstd = Command::new("zstd");
-    zstd.args(["--quiet", "--threads=0", "--force"])
-        .arg(&dump_path)
-        .arg("--output")
-        .arg(&compressed_path);
+    let mut zstd = zstd_command(&dump_path, &compressed_path);
     run_checked(&mut zstd, "zstd")?;
     fs::remove_file(&dump_path).context("failed to remove plaintext dump")?;
 
@@ -215,6 +211,16 @@ fn perform_backup(config: &Config, target: &TargetConfig) -> Result<BackupOutcom
         encrypted_bytes,
         encrypted_sha256,
     })
+}
+
+fn zstd_command(source: &Path, destination: &Path) -> Command {
+    let mut command = Command::new("zstd");
+    command
+        .args(["--quiet", "--threads=0", "--force"])
+        .arg(source)
+        .arg("-o")
+        .arg(destination);
+    command
 }
 
 pub fn postgres_command(program: &str, target: &TargetConfig) -> Result<Command> {
@@ -488,5 +494,25 @@ age_recipient = "age1test"
             .and_then(|(_, value)| value)
             .unwrap();
         assert_eq!(password, "p@ssword");
+    }
+
+    #[test]
+    fn zstd_command_uses_portable_output_flag() {
+        let command = zstd_command(Path::new("database.dump"), Path::new("database.dump.zst"));
+        let arguments = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            arguments,
+            [
+                "--quiet",
+                "--threads=0",
+                "--force",
+                "database.dump",
+                "-o",
+                "database.dump.zst"
+            ]
+        );
     }
 }
