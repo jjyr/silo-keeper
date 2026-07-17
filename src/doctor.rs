@@ -1,9 +1,7 @@
-use std::fs;
-use std::process::Command;
-
 use anyhow::{Result, bail};
+use std::fs;
 
-use crate::backup::{aws_command, run_checked};
+use crate::backup::{aws_command, postgres_command, run_checked};
 use crate::config::Config;
 use crate::util::command_exists;
 
@@ -38,10 +36,12 @@ pub fn run(config: &Config) -> Result<()> {
 
     if command_exists("pg_isready") {
         for target in config.targets.iter().filter(|target| target.enabled) {
-            let status = Command::new("pg_isready")
-                .env("PGDATABASE", &target.database_url)
-                .args(["--timeout", "5"])
-                .status();
+            let status = postgres_command("pg_isready", target).and_then(|mut command| {
+                command
+                    .args(["--timeout", "5"])
+                    .status()
+                    .map_err(Into::into)
+            });
             let success = status.is_ok_and(|status| status.success());
             failed |= !report(
                 &format!("database {}", target.name),

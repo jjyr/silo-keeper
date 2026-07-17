@@ -7,6 +7,7 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail, ensure};
 use chrono::{DateTime, Duration, Utc};
 use fs2::FileExt;
+use percent_encoding::percent_decode_str;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -138,9 +139,8 @@ fn perform_backup(config: &Config, target: &TargetConfig) -> Result<BackupOutcom
         .path()
         .join(format!("{}-{}.manifest.json", target.name, timestamp));
 
-    let mut pg_dump = Command::new("pg_dump");
+    let mut pg_dump = postgres_command("pg_dump", target)?;
     pg_dump
-        .env("PGDATABASE", &target.database_url)
         .args(["--format=custom", "--compress=0", "--file"])
         .arg(&dump_path);
     run_checked(&mut pg_dump, "pg_dump")?;
@@ -215,6 +215,30 @@ fn perform_backup(config: &Config, target: &TargetConfig) -> Result<BackupOutcom
         encrypted_bytes,
         encrypted_sha256,
     })
+}
+
+pub fn postgres_command(program: &str, target: &TargetConfig) -> Result<Command> {
+    let mut database_url = url::Url::parse(&target.database_url)
+        .context("target database_url is not a valid PostgreSQL URL")?;
+    let password = database_url
+        .password()
+        .map(|value| {
+            percent_decode_str(value)
+                .decode_utf8()
+                .context("target database_url password is not valid UTF-8")
+                .map(|value| value.into_owned())
+        })
+        .transpose()?;
+    database_url
+        .set_password(None)
+        .map_err(|_| anyhow::anyhow!("failed to remove password from target database_url"))?;
+
+    let mut command = Command::new(program);
+    command.arg("--dbname").arg(database_url.as_str());
+    if let Some(password) = password {
+        command.env("PGPASSWORD", password);
+    }
+    Ok(command)
 }
 
 fn upload_file(
@@ -442,5 +466,27 @@ age_recipient = "age1test"
             message,
             "failed for <redacted> with <redacted> and <redacted>"
         );
+    }
+
+    #[test]
+    fn postgres_commands_keep_passwords_out_of_process_arguments() {
+        let mut config = config();
+        config.targets[0].database_url =
+            "postgresql://backup:p%40ssword@127.0.0.1:5432/production".to_owned();
+        let command = postgres_command("pg_dump", &config.targets[0]).unwrap();
+        let arguments = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            arguments,
+            ["--dbname", "postgresql://backup@127.0.0.1:5432/production"]
+        );
+        let password = command
+            .get_envs()
+            .find(|(name, _)| *name == "PGPASSWORD")
+            .and_then(|(_, value)| value)
+            .unwrap();
+        assert_eq!(password, "p@ssword");
     }
 }

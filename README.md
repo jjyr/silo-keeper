@@ -90,8 +90,8 @@ Versioning 和 Object Lock 需由服务商确认。
 - `defaults`：状态目录、scratch 目录、timer 随机延迟和 stale 阈值。
 - `targets`：数据库 URL、systemd `OnCalendar`、age recipient 和 Healthchecks URL。
 
-`database_url` 只通过 `PGDATABASE` 环境变量传给 libpq，不会出现在 `pg_dump` 命令行。
-运行记录不会保存数据库 URL、S3 secret 或 Healthchecks URL。
+`database_url` 中的密码会被拆分到 `PGPASSWORD` 环境变量，`pg_dump` 命令行只接收已移除
+密码的连接 URI。运行记录不会保存数据库 URL、S3 secret 或 Healthchecks URL。
 
 ## 安全约束
 
