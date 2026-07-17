@@ -2,7 +2,7 @@
 name = "silo-keeper"
 version = "0.1.0"
 edition = "2024"
-authors = ["jjyr <jjyruby@gmail.com>"]
+authors = ["jjy <jjyruby@gmail.com>"]
 description = "Encrypted PostgreSQL backups to versioned S3 with age and systemd"
 license = "MIT"
 readme = "README.md"
