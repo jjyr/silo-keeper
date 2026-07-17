@@ -1,136 +1,195 @@
 # Silo Keeper
 
-Silo Keeper 是部署在数据所在生产机上的战时备份粮仓。第一版专注于一件事：
+Silo Keeper is a small PostgreSQL backup service for Linux hosts. It runs next
+to the database, encrypts each logical backup with an offline `age` public key,
+and uploads the result and a recovery manifest to versioned S3 storage.
+
+## How it works
 
 ```text
-PostgreSQL pg_dump -> zstd -> age -> S3 -> Healthchecks
+pg_dump -> zstd -> age -> encrypted file -> S3 object + JSON manifest
 ```
 
-它不需要额外的备份服务器。每台生产机运行同一个 `silo-keeper` 二进制，通过一个
-root-only TOML 文件声明本机需要备份的数据库。
+The dump, compression, and encryption processes are connected as a streaming
+pipeline. Plaintext dumps are never written to disk. The encrypted object is
+hashed, uploaded, and verified with `head-object` before a run is considered
+successful.
 
-## 功能
+A local state file records each upload phase, object key, VersionId, size, and
+SHA-256 hash. A per-target lock prevents overlapping runs. The installer creates
+systemd timers; scheduled failures are retried three times at 15-minute
+intervals.
 
-- 一个 TOML 文件配置多个 PostgreSQL target。
-- `status` 查看最近运行、最近成功、备份大小和 timer 状态。
-- `run` 立即运行指定备份，并用文件锁阻止同一 target 并发执行。
-- `history` 查询不包含 secret 的本地执行记录。
-- `doctor` 默认检查依赖和连通性，`--canary` 可验证真实 dump/上传权限。
-- `install` 以可回滚事务安装二进制、配置和 systemd timers。
-- `uninstall` 一条命令停止并移除调度环境，默认保留配置、状态和远端备份。
+## Requirements
 
-## 快速开始
+- Linux with systemd
+- `pg_dump`, `pg_isready`, `zstd`, `age`, and AWS CLI
+- `curl` when a Healthchecks URL is configured
+- An S3 bucket with Versioning enabled
+- An `age` recipient public key; keep the corresponding identity offline
 
-构建：
+Object Lock is optional. When `object_lock_days` is greater than zero, Silo
+Keeper also verifies the uploaded object's retention metadata.
+
+## Build
 
 ```bash
 mise run build
 ```
 
-准备配置。配置包含数据库和 S3 secret，必须是 root-only：
+The release binary is written to `target/release/silo-keeper`.
+
+## Example configuration
+
+Create `config.toml` from the following example and replace every placeholder:
+
+```toml
+version = 1
+
+[storage]
+type = "s3"
+bucket = "company-production-backups"
+region = "eu-central-1"
+# Optional for AWS S3; required for an S3-compatible provider.
+endpoint = "https://s3.eu-central-1.amazonaws.com"
+prefix = "silo-keeper"
+access_key_id = "<s3-access-key>"
+secret_access_key = "<s3-secret-key>"
+# session_token = "<optional-session-token>"
+# Set to 0 when Object Lock is not used. Versioning is always required.
+object_lock_days = 14
+
+[defaults]
+state_dir = "/var/lib/silo-keeper"
+scratch_dir = "/var/lib/silo-keeper/tmp"
+randomized_delay_seconds = 900
+max_backup_age_hours = 36
+
+[[targets]]
+name = "production-db"
+type = "postgres"
+database_url = "postgres://backup-user:<password>@127.0.0.1:5432/production"
+on_calendar = "*-*-* 02:15:00 UTC"
+age_recipient = "age1..."
+healthcheck_url = "https://hc-ping.com/<check-id>"
+enabled = true
+# Optional; overrides defaults.max_backup_age_hours for this target.
+max_backup_age_hours = 36
+```
+
+The configuration contains secrets and must not be readable by other users:
 
 ```bash
-cp config.example.toml config.toml
 chmod 600 config.toml
 ```
 
-安装并启动所有 enabled targets：
+Put the database password in URL userinfo as shown above. Sensitive query
+parameters such as `?password=...`, `?sslpassword=...`, and token parameters are
+rejected so they cannot appear in process arguments.
+
+## Install
+
+Install the binary, root-only configuration, and timers:
 
 ```bash
 sudo ./target/release/silo-keeper --config ./config.toml install
 ```
 
-这条命令会安装当前二进制和配置、生成 systemd service/timer，并立即启用调度。
-日常不需要在生产机上保留源码目录。
-
-如果是全新的 Ubuntu/Hetzner 主机，可以让安装命令补齐 `pg_dump`、`zstd`、`age`、
-AWS CLI 和 `curl`：
+On a new Ubuntu host, Silo Keeper can install missing runtime packages with
+`apt-get`:
 
 ```bash
-sudo ./target/release/silo-keeper --config ./config.toml install --install-dependencies
+sudo ./target/release/silo-keeper --config ./config.toml \
+  install --install-dependencies
 ```
 
-常用命令：
+The installed paths are:
+
+```text
+/usr/local/bin/silo-keeper
+/etc/silo-keeper/config.toml
+/var/lib/silo-keeper
+/etc/systemd/system/silo-keeper@.service
+/etc/systemd/system/silo-keeper@<target>.timer
+```
+
+Installation and upgrades are transactional: schedules and `age` recipients
+are checked first, files are replaced atomically, and the previous installation
+is restored if the new timers cannot be activated.
+
+## Command-line usage
+
+Validate a configuration before installing it:
+
+```bash
+sudo silo-keeper --config /etc/silo-keeper/config.toml check
+```
+
+Inspect all targets or one target:
 
 ```bash
 sudo silo-keeper status
 sudo silo-keeper status production-db
+sudo silo-keeper status production-db --json
+```
+
+Run a backup immediately:
+
+```bash
 sudo silo-keeper run production-db
+```
+
+Read local execution history:
+
+```bash
 sudo silo-keeper history production-db --limit 20
+sudo silo-keeper history production-db --limit 20 --json
+```
+
+Check commands, directories, database connectivity, and S3 connectivity:
+
+```bash
 sudo silo-keeper doctor
+```
+
+Exercise real backup permissions with a full `pg_dump` to `/dev/null` and a
+small retained S3 canary object:
+
+```bash
 sudo silo-keeper doctor --canary
 ```
 
-普通 `doctor` 中的 `pg_isready` 和 `head-bucket` 只是连通性检查，不代表备份账号拥有
-读取全部数据库对象及上传 S3 对象的权限。`doctor --canary` 会把一次完整 `pg_dump` 写到
-`/dev/null`，并上传、验证一个很小的 versioned S3 canary 对象；这可能给数据库带来一次
-完整读取负载，且 canary 对象会保留在 `<prefix>/_doctor/` 下（兼容 Object Lock 和无删除
-权限的最小权限凭据）。
+The canary can read the full database and leaves its versioned object under
+`<prefix>/_doctor/`; use it deliberately.
 
-停止并卸载调度环境：
+Remove the binary and systemd scheduling while preserving configuration, local
+history, and remote backups:
 
 ```bash
 sudo silo-keeper uninstall
 ```
 
-该命令不会删除 S3 备份，也不会删除 `/etc/silo-keeper/config.toml` 和
-`/var/lib/silo-keeper`。只有显式添加 `--purge-local` 才会删除本地配置与历史。
+Also remove local configuration and history:
 
-## S3 前置条件
-
-- bucket 必须已启用 Versioning；没有 `VersionId` 的上传会被判为失败。
-- 若 `object_lock_days > 0`，bucket 必须在创建时启用 Object Lock，并配置不短于该值的
-  默认 retention。Silo Keeper 会验证 retention，但不会替你改变 bucket 策略。
-- S3 凭据应只允许访问指定 bucket/prefix，至少具备上传、读取对象元数据、读取 retention
-  和恢复所需的读取权限。
-- `age_recipient` 是公钥，可以留在生产配置中；对应私钥必须另存于离线介质或独立密钥
-  管理系统。不要只把解密私钥放在被备份的生产机上。
-
-AWS S3 可以省略 `storage.endpoint`。其他兼容 S3 的服务应填写其 HTTPS endpoint；是否支持
-Versioning 和 Object Lock 需由服务商确认。
-
-## 配置说明
-
-生产配置安装到 `/etc/silo-keeper/config.toml`，权限固定为 `0600`。主要字段：
-
-- `storage`：S3 bucket、region、endpoint、凭据、公共 prefix 和 Object Lock 要求。
-- `defaults`：状态目录、scratch 目录、timer 随机延迟和 stale 阈值。
-- `targets`：数据库 URL、systemd `OnCalendar`、age recipient 和 Healthchecks URL。
-
-`database_url` 的 userinfo 密码会被拆分到 `PGPASSWORD` 环境变量，`pg_dump` 命令行只接收
-已移除密码的连接 URI。`password`、`sslpassword`、token 等敏感 query 参数会被拒绝，避免
-secret 出现在进程参数中。运行记录不会保存数据库 URL、S3 secret 或 Healthchecks URL。
-
-## 安全约束
-
-- 配置不是 root 所有或存在 group/other 权限时，生产命令拒绝运行。
-- `pg_dump`、`zstd` 和 `age` 使用流式管道，scratch 目录只落盘加密 dump，不会留下明文
-  dump 或压缩明文 dump，即使进程被异常终止也是如此。
-- S3 备份只有在上传和 `head-object` 验证成功后才记录为成功。
-- 上传过程会分阶段原子写入本地状态；manifest 失败时，已上传备份的 key、VersionId、大小
-  和 SHA-256 仍可从 `status --json` 或 `history --json` 找回。
-- `object_lock_days > 0` 时，每个备份必须返回 VersionId、Object Lock mode 和足够的
-  retention，否则本次运行失败。
-- 定时备份失败后每 15 分钟重试一次，最多额外重试 3 次；手动 `run` 仍只执行一次。
-- 安装/升级会先验证 timer 日历和 age recipient，再原子替换文件并验证新 timers 已启动；
-  只有新调度可用后才删除旧 timers，失败时恢复旧文件及旧 timer 的启用/运行状态。
-- Healthchecks 是 best-effort；监控服务不可用不会使一个已经成功的备份失败。
-- `uninstall` 永远不会自动删除远端对象。
-
-## 恢复演练
-
-备份不等于可恢复。上线后应至少每月把一个备份恢复到隔离数据库，并核对业务关键表。
-基本流程如下：
-
-```text
-S3 下载指定 VersionId -> 按 manifest 校验 SHA-256 -> age 解密
--> zstd 解压 -> pg_restore 到隔离数据库 -> 业务校验
+```bash
+sudo silo-keeper uninstall --purge-local
 ```
 
-manifest 与加密备份放在相同日期 prefix 下，记录对象 key、VersionId、大小和加密文件的
-SHA-256。恢复时应优先使用 manifest 中的 VersionId，而不是默认取对象的 latest 版本。
+Remote S3 objects are never deleted by `uninstall`.
 
-## 开发
+## Recovery
+
+Use the manifest's exact object key and VersionId during recovery:
+
+```text
+download object VersionId -> verify SHA-256 -> age decrypt -> zstd decompress
+-> pg_restore into an isolated database -> validate application data
+```
+
+Test this process regularly. A successful upload is not a substitute for a
+restore drill.
+
+## Development
 
 ```bash
 mise run check
