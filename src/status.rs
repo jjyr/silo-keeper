@@ -5,7 +5,7 @@ use chrono::Utc;
 use serde::Serialize;
 
 use crate::config::{Config, TargetConfig};
-use crate::state::{RunRecord, RunStatus, StateStore};
+use crate::state::{RunPhase, RunRecord, RunStatus, StateStore};
 use crate::util::command_exists;
 
 #[derive(Debug, Serialize)]
@@ -65,13 +65,30 @@ pub fn show(config: &Config, target_name: Option<&str>, json: bool) -> Result<()
             "{:<24} {:<10} {:<10} {:<22} {:>10}",
             status.target, status.state, status.timer, last_success, size
         );
-        if let Some(error) = status
+        if let Some(record) = status
             .last_attempt
             .as_ref()
             .filter(|record| record.status == RunStatus::Failed)
-            .and_then(|record| record.error.as_deref())
         {
-            println!("  last error: {error}");
+            if let Some(error) = record.error.as_deref() {
+                println!("  last error: {error}");
+            }
+            if matches!(
+                record.phase,
+                RunPhase::BackupUploaded
+                    | RunPhase::BackupVerified
+                    | RunPhase::UploadingManifest
+                    | RunPhase::ManifestUploaded
+                    | RunPhase::ManifestVerified
+            ) && let Some(key) = record.backup_key.as_deref()
+            {
+                println!(
+                    "  recoverable backup: s3://{}/{} (VersionId {})",
+                    config.storage.bucket,
+                    key,
+                    record.backup_version_id.as_deref().unwrap_or("unknown")
+                );
+            }
         }
     }
     Ok(())
@@ -154,7 +171,7 @@ fn timer_state(target: &str, enabled: bool) -> String {
     if !command_exists("systemctl") {
         return "unknown".to_owned();
     }
-    let unit = format!("moat-silo@{target}.timer");
+    let unit = format!("silo-keeper@{target}.timer");
     match Command::new("systemctl")
         .args(["is-active", "--quiet", &unit])
         .stdout(Stdio::null())

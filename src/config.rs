@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 
-pub const INSTALLED_CONFIG_PATH: &str = "/etc/moat-silo/config.toml";
+pub const INSTALLED_CONFIG_PATH: &str = "/etc/silo-keeper/config.toml";
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -53,8 +53,8 @@ pub struct DefaultsConfig {
 impl Default for DefaultsConfig {
     fn default() -> Self {
         Self {
-            state_dir: PathBuf::from("/var/lib/moat-silo"),
-            scratch_dir: PathBuf::from("/var/lib/moat-silo/tmp"),
+            state_dir: PathBuf::from("/var/lib/silo-keeper"),
+            scratch_dir: PathBuf::from("/var/lib/silo-keeper/tmp"),
             randomized_delay_seconds: 900,
             max_backup_age_hours: 36,
         }
@@ -159,8 +159,8 @@ impl Config {
         ensure!(
             self.defaults
                 .state_dir
-                .starts_with(Path::new("/var/lib/moat-silo")),
-            "defaults.state_dir must be /var/lib/moat-silo or one of its subdirectories"
+                .starts_with(Path::new("/var/lib/silo-keeper")),
+            "defaults.state_dir must be /var/lib/silo-keeper or one of its subdirectories"
         );
         ensure!(
             self.defaults.scratch_dir.is_absolute(),
@@ -198,16 +198,12 @@ impl Config {
                 target.name
             );
             ensure!(
-                target.database_url.starts_with("postgres://")
-                    || target.database_url.starts_with("postgresql://"),
-                "target {} database_url must be a PostgreSQL URL",
-                target.name
-            );
-            ensure!(
                 !contains_line_break(&target.database_url),
                 "target {} database_url contains a line break",
                 target.name
             );
+            validated_database_url(&target.database_url)
+                .with_context(|| format!("target {} database_url is invalid", target.name))?;
             ensure!(
                 !target.on_calendar.trim().is_empty() && !contains_line_break(&target.on_calendar),
                 "target {} on_calendar is invalid",
@@ -249,6 +245,38 @@ impl Config {
             .max_backup_age_hours
             .unwrap_or(self.defaults.max_backup_age_hours)
     }
+}
+
+pub(crate) fn validated_database_url(value: &str) -> Result<url::Url> {
+    let database_url = url::Url::parse(value).context("not a valid PostgreSQL URL")?;
+    ensure!(
+        matches!(database_url.scheme(), "postgres" | "postgresql"),
+        "must use the postgres or postgresql scheme"
+    );
+    for (name, _) in database_url.query_pairs() {
+        ensure!(
+            !is_sensitive_query_parameter(&name),
+            "sensitive query parameter {name:?} is forbidden; put the database password in URL userinfo"
+        );
+    }
+    Ok(database_url)
+}
+
+fn is_sensitive_query_parameter(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        "password"
+            | "passwd"
+            | "passfile"
+            | "sslpassword"
+            | "oauth_client_secret"
+            | "access_token"
+            | "token"
+    ) || name.ends_with("_password")
+        || name.ends_with("_passwd")
+        || name.ends_with("_secret")
+        || name.ends_with("_token")
 }
 
 pub fn ensure_secure_config(path: &Path, require_root_owner: bool) -> Result<()> {
@@ -304,7 +332,7 @@ fn default_true() -> bool {
 }
 
 fn default_storage_prefix() -> String {
-    "moat-silo".to_owned()
+    "silo-keeper".to_owned()
 }
 
 #[cfg(test)]
@@ -374,16 +402,33 @@ age_recipient = "age1test"
     }
 
     #[test]
+    fn rejects_database_secrets_in_query_parameters() {
+        for query in [
+            "password=secret",
+            "sslpassword=secret",
+            "oauth_client_secret=secret",
+            "ACCESS_TOKEN=secret",
+        ] {
+            let raw = VALID.replace(
+                "localhost/production",
+                &format!("localhost/production?{query}"),
+            );
+            let error = format!("{:#}", Config::parse(&raw).unwrap_err());
+            assert!(error.contains("sensitive query parameter"), "{error}");
+        }
+    }
+
+    #[test]
     fn rejects_dangerous_state_paths_and_insecure_healthchecks() {
         let dangerous_state = VALID.replace(
             "[[targets]]",
-            "[defaults]\nstate_dir = \"/var/lib/moat-silo/../..\"\n\n[[targets]]",
+            "[defaults]\nstate_dir = \"/var/lib/silo-keeper/../..\"\n\n[[targets]]",
         );
         assert!(Config::parse(&dangerous_state).is_err());
 
         let external_scratch = VALID.replace(
             "[[targets]]",
-            "[defaults]\nscratch_dir = \"/tmp/moat-silo\"\n\n[[targets]]",
+            "[defaults]\nscratch_dir = \"/tmp/silo-keeper\"\n\n[[targets]]",
         );
         assert!(Config::parse(&external_scratch).is_err());
 

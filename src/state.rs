@@ -15,10 +15,26 @@ pub enum RunStatus {
     Failed,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum RunPhase {
+    #[default]
+    Preparing,
+    Encrypted,
+    UploadingBackup,
+    BackupUploaded,
+    BackupVerified,
+    UploadingManifest,
+    ManifestUploaded,
+    ManifestVerified,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunRecord {
     pub target: String,
     pub status: RunStatus,
+    #[serde(default)]
+    pub phase: RunPhase,
     pub started_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
     pub duration_seconds: Option<u64>,
@@ -26,6 +42,7 @@ pub struct RunRecord {
     pub backup_key: Option<String>,
     pub manifest_key: Option<String>,
     pub backup_version_id: Option<String>,
+    pub manifest_version_id: Option<String>,
     pub encrypted_bytes: Option<u64>,
     pub encrypted_sha256: Option<String>,
     pub error: Option<String>,
@@ -36,6 +53,7 @@ impl RunRecord {
         Self {
             target: target.to_owned(),
             status: RunStatus::Running,
+            phase: RunPhase::Preparing,
             started_at: Utc::now(),
             finished_at: None,
             duration_seconds: None,
@@ -43,6 +61,7 @@ impl RunRecord {
             backup_key: None,
             manifest_key: None,
             backup_version_id: None,
+            manifest_version_id: None,
             encrypted_bytes: None,
             encrypted_sha256: None,
             error: None,
@@ -193,6 +212,7 @@ fn atomic_json_write(path: &Path, value: &impl Serialize) -> Result<()> {
     temporary
         .persist(path)
         .with_context(|| format!("failed to publish state file {}", path.display()))?;
+    File::open(parent)?.sync_all()?;
     Ok(())
 }
 
@@ -247,5 +267,17 @@ mod tests {
         assert!(state.is_lock_held("production-db").unwrap());
         lock.unlock().unwrap();
         assert!(!state.is_lock_held("production-db").unwrap());
+    }
+
+    #[test]
+    fn old_records_default_to_preparing_phase() {
+        let record = RunRecord::running("production-db");
+        let mut value = serde_json::to_value(record).unwrap();
+        value.as_object_mut().unwrap().remove("phase");
+        value.as_object_mut().unwrap().remove("manifest_version_id");
+
+        let restored: RunRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.phase, RunPhase::Preparing);
+        assert_eq!(restored.manifest_version_id, None);
     }
 }

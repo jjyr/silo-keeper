@@ -15,7 +15,7 @@ use crate::config::{Config, INSTALLED_CONFIG_PATH};
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "moat-silo",
+    name = "silo-keeper",
     version,
     about = "A production backup reserve for PostgreSQL and S3"
 )]
@@ -30,8 +30,12 @@ struct Cli {
 enum Commands {
     /// Validate the TOML configuration and its filesystem permissions.
     Check,
-    /// Check runtime commands, database connectivity, and S3 access.
-    Doctor,
+    /// Check runtime commands and connectivity, optionally exercising real backup permissions.
+    Doctor {
+        /// Run a full pg_dump to /dev/null and upload a retained tiny S3 canary object.
+        #[arg(long)]
+        canary: bool,
+    },
     /// Show backup and systemd timer status.
     Status {
         target: Option<String>,
@@ -40,6 +44,8 @@ enum Commands {
     },
     /// Run one backup target immediately.
     Run { target: String },
+    #[command(hide = true, name = "run-scheduled")]
+    RunScheduled { target: String },
     /// Show local execution history for one target.
     History {
         target: String,
@@ -88,11 +94,15 @@ fn run() -> Result<()> {
                     );
                     Ok(())
                 }
-                Commands::Doctor => doctor::run(&config),
+                Commands::Doctor { canary } => doctor::run(&config, canary),
                 Commands::Status { target, json } => status::show(&config, target.as_deref(), json),
                 Commands::Run { target } => {
                     let target = config.target(&target)?;
                     backup::run(&config, target)
+                }
+                Commands::RunScheduled { target } => {
+                    let target = config.target(&target)?;
+                    backup::run_scheduled(&config, target)
                 }
                 Commands::History {
                     target,

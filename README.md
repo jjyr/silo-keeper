@@ -1,12 +1,12 @@
-# Moat Silo
+# Silo Keeper
 
-Moat Silo 是部署在数据所在生产机上的战时备份粮仓。第一版专注于一件事：
+Silo Keeper 是部署在数据所在生产机上的战时备份粮仓。第一版专注于一件事：
 
 ```text
 PostgreSQL pg_dump -> zstd -> age -> S3 -> Healthchecks
 ```
 
-它不需要额外的备份服务器。每台生产机运行同一个 `moat-silo` 二进制，通过一个
+它不需要额外的备份服务器。每台生产机运行同一个 `silo-keeper` 二进制，通过一个
 root-only TOML 文件声明本机需要备份的数据库。
 
 ## 功能
@@ -15,8 +15,8 @@ root-only TOML 文件声明本机需要备份的数据库。
 - `status` 查看最近运行、最近成功、备份大小和 timer 状态。
 - `run` 立即运行指定备份，并用文件锁阻止同一 target 并发执行。
 - `history` 查询不包含 secret 的本地执行记录。
-- `doctor` 检查配置权限、依赖、数据库连接和 S3 权限。
-- `install` 自安装二进制、配置和 systemd timers。
+- `doctor` 默认检查依赖和连通性，`--canary` 可验证真实 dump/上传权限。
+- `install` 以可回滚事务安装二进制、配置和 systemd timers。
 - `uninstall` 一条命令停止并移除调度环境，默认保留配置、状态和远端备份。
 
 ## 快速开始
@@ -37,7 +37,7 @@ chmod 600 config.toml
 安装并启动所有 enabled targets：
 
 ```bash
-sudo ./target/release/moat-silo --config ./config.toml install
+sudo ./target/release/silo-keeper --config ./config.toml install
 ```
 
 这条命令会安装当前二进制和配置、生成 systemd service/timer，并立即启用调度。
@@ -47,33 +47,40 @@ sudo ./target/release/moat-silo --config ./config.toml install
 AWS CLI 和 `curl`：
 
 ```bash
-sudo ./target/release/moat-silo --config ./config.toml install --install-dependencies
+sudo ./target/release/silo-keeper --config ./config.toml install --install-dependencies
 ```
 
 常用命令：
 
 ```bash
-sudo moat-silo status
-sudo moat-silo status production-db
-sudo moat-silo run production-db
-sudo moat-silo history production-db --limit 20
-sudo moat-silo doctor
+sudo silo-keeper status
+sudo silo-keeper status production-db
+sudo silo-keeper run production-db
+sudo silo-keeper history production-db --limit 20
+sudo silo-keeper doctor
+sudo silo-keeper doctor --canary
 ```
+
+普通 `doctor` 中的 `pg_isready` 和 `head-bucket` 只是连通性检查，不代表备份账号拥有
+读取全部数据库对象及上传 S3 对象的权限。`doctor --canary` 会把一次完整 `pg_dump` 写到
+`/dev/null`，并上传、验证一个很小的 versioned S3 canary 对象；这可能给数据库带来一次
+完整读取负载，且 canary 对象会保留在 `<prefix>/_doctor/` 下（兼容 Object Lock 和无删除
+权限的最小权限凭据）。
 
 停止并卸载调度环境：
 
 ```bash
-sudo moat-silo uninstall
+sudo silo-keeper uninstall
 ```
 
-该命令不会删除 S3 备份，也不会删除 `/etc/moat-silo/config.toml` 和
-`/var/lib/moat-silo`。只有显式添加 `--purge-local` 才会删除本地配置与历史。
+该命令不会删除 S3 备份，也不会删除 `/etc/silo-keeper/config.toml` 和
+`/var/lib/silo-keeper`。只有显式添加 `--purge-local` 才会删除本地配置与历史。
 
 ## S3 前置条件
 
 - bucket 必须已启用 Versioning；没有 `VersionId` 的上传会被判为失败。
 - 若 `object_lock_days > 0`，bucket 必须在创建时启用 Object Lock，并配置不短于该值的
-  默认 retention。Moat Silo 会验证 retention，但不会替你改变 bucket 策略。
+  默认 retention。Silo Keeper 会验证 retention，但不会替你改变 bucket 策略。
 - S3 凭据应只允许访问指定 bucket/prefix，至少具备上传、读取对象元数据、读取 retention
   和恢复所需的读取权限。
 - `age_recipient` 是公钥，可以留在生产配置中；对应私钥必须另存于离线介质或独立密钥
@@ -84,21 +91,29 @@ Versioning 和 Object Lock 需由服务商确认。
 
 ## 配置说明
 
-生产配置安装到 `/etc/moat-silo/config.toml`，权限固定为 `0600`。主要字段：
+生产配置安装到 `/etc/silo-keeper/config.toml`，权限固定为 `0600`。主要字段：
 
 - `storage`：S3 bucket、region、endpoint、凭据、公共 prefix 和 Object Lock 要求。
 - `defaults`：状态目录、scratch 目录、timer 随机延迟和 stale 阈值。
 - `targets`：数据库 URL、systemd `OnCalendar`、age recipient 和 Healthchecks URL。
 
-`database_url` 中的密码会被拆分到 `PGPASSWORD` 环境变量，`pg_dump` 命令行只接收已移除
-密码的连接 URI。运行记录不会保存数据库 URL、S3 secret 或 Healthchecks URL。
+`database_url` 的 userinfo 密码会被拆分到 `PGPASSWORD` 环境变量，`pg_dump` 命令行只接收
+已移除密码的连接 URI。`password`、`sslpassword`、token 等敏感 query 参数会被拒绝，避免
+secret 出现在进程参数中。运行记录不会保存数据库 URL、S3 secret 或 Healthchecks URL。
 
 ## 安全约束
 
 - 配置不是 root 所有或存在 group/other 权限时，生产命令拒绝运行。
+- `pg_dump`、`zstd` 和 `age` 使用流式管道，scratch 目录只落盘加密 dump，不会留下明文
+  dump 或压缩明文 dump，即使进程被异常终止也是如此。
 - S3 备份只有在上传和 `head-object` 验证成功后才记录为成功。
+- 上传过程会分阶段原子写入本地状态；manifest 失败时，已上传备份的 key、VersionId、大小
+  和 SHA-256 仍可从 `status --json` 或 `history --json` 找回。
 - `object_lock_days > 0` 时，每个备份必须返回 VersionId、Object Lock mode 和足够的
   retention，否则本次运行失败。
+- 定时备份失败后每 15 分钟重试一次，最多额外重试 3 次；手动 `run` 仍只执行一次。
+- 安装/升级会先验证 timer 日历和 age recipient，再原子替换文件并验证新 timers 已启动；
+  只有新调度可用后才删除旧 timers，失败时恢复旧文件及旧 timer 的启用/运行状态。
 - Healthchecks 是 best-effort；监控服务不可用不会使一个已经成功的备份失败。
 - `uninstall` 永远不会自动删除远端对象。
 
