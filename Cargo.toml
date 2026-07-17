@@ -2,8 +2,14 @@
 name = "silo-keeper"
 version = "0.1.0"
 edition = "2024"
-description = "A small production backup reserve for PostgreSQL and S3"
+authors = ["jjyr <jjyruby@gmail.com>"]
+description = "Encrypted PostgreSQL backups to versioned S3 with age and systemd"
 license = "MIT"
+readme = "README.md"
+repository = "https://github.com/jjyr/silo-keeper"
+homepage = "https://github.com/jjyr/silo-keeper"
+keywords = ["postgresql", "backup", "s3", "encryption", "systemd"]
+categories = ["command-line-utilities", "database"]
 
 [dependencies]
 anyhow = "1.0"
